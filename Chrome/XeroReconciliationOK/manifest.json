@@ -1,7 +1,7 @@
 {
 	"manifest_version": 3,
 	"name": "Xero Reconciliation OK",
-	"version": "2.3.7",
+	"version": "2.4.0",
 	"description": "Auto-clicks OK on rule-matched bank statement lines and auto-creates Bank Rules from local API.",
 	"content_scripts": [
 		{
