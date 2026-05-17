@@ -45,7 +45,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 				const json = await tryFetch("/api/xero/bank-rules/sync", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ rules: msg.rules }),
+					body: JSON.stringify({ rules: msg.rules, replace: true }),
 				});
 				sendResponse({ ok: true, ...json });
 

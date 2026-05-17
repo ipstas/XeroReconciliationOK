@@ -11,7 +11,7 @@
  *   SELECTOR_SUMMARY_HEADER   — the header element to inject the trigger button into
  */
 
-console.log("[XeroOK] content script loaded v2.4.0 @", new Date().toLocaleTimeString());
+console.log("[XeroOK] content script loaded v2.5.0 @", new Date().toLocaleTimeString());
 
 // ── Selectors ────────────────────────────────────────────────────────────────
 const SELECTOR_OK_BUTTON      = "div.ok a.okayButton"; // confirmed May 2026
@@ -409,6 +409,13 @@ async function createXeroRule(rawRule, { skipNavigate = false } = {}) {
 	const finalInputs = visibleInputs();
 	console.log(`[XeroOK] Field values before save:`, finalInputs.map((el, i) => `[${i}] "${el.value?.slice(0, 40)}"`));
 
+	// Snapshot existing rule IDs before save so we can detect the newly created one
+	const existingIds = new Set(
+		[...document.querySelectorAll("a[href*='bank-rules/edit']")]
+			.map(a => (a.href ?? "").match(/bank-rules\/edit\/([0-9a-f-]{36})/i)?.[1])
+			.filter(Boolean)
+	);
+
 	console.log("[XeroOK] clicking Save");
 	const urlBefore = location.href;
 	saveBtn.click();
@@ -424,110 +431,242 @@ async function createXeroRule(rawRule, { skipNavigate = false } = {}) {
 		setTimeout(check, 800);
 	});
 
-	if (saved) {
-		console.log(`[XeroOK] ✓ Rule saved — URL changed to: ${location.href}`);
-	} else {
-		// Log any visible validation errors to help debug
+	if (!saved) {
 		const errors = [...document.querySelectorAll("[class*='error'], [class*='Error'], [class*='invalid'], .validation-error")]
 			.filter(el => el.offsetParent && el.textContent.trim())
 			.map(el => el.textContent.trim().slice(0, 100));
 		console.warn(`[XeroOK] ✗ Save failed — URL unchanged after 15s`);
-		if (errors.length) console.warn(`[XeroOK] Validation errors found:`, errors);
+		if (errors.length) console.warn(`[XeroOK] Validation errors:`, errors);
 		throw new Error("Save failed — URL did not change");
 	}
+
+	// Wait for the list page to re-render and show the new edit link
+	await sleep(800);
+	const newLink = [...document.querySelectorAll("a[href*='bank-rules/edit']")]
+		.find(a => {
+			const id = (a.href ?? "").match(/bank-rules\/edit\/([0-9a-f-]{36})/i)?.[1];
+			return id && !existingIds.has(id);
+		});
+	const newRuleId = (newLink?.href ?? "").match(/bank-rules\/edit\/([0-9a-f-]{36})/i)?.[1] ?? null;
+	console.log(`[XeroOK] ✓ Rule saved — xero_rule_id=${newRuleId ?? "not found"} URL=${location.href}`);
+	return newRuleId;
 }
 
-// Scrape condition values from the current bank rules list page
-function scrapeRulesFromPage() {
-	// Each rule row has a condition value cell — grab all non-empty text from rule rows
-	return [...document.querySelectorAll("table tr, [class*='rule-row'], [class*='ruleRow']")]
-		.flatMap(row => [...row.querySelectorAll("td, [class*='condition'], [class*='value']")])
-		.map(el => el.textContent?.trim())
-		.filter(Boolean);
+// Get all Edit link elements from the current bank rules list page
+function getEditLinkElements() {
+	const links = [...document.querySelectorAll("a[href*='bank-rules/edit']")];
+	console.log(`[XeroOK] found ${links.length} edit links`);
+	return links;
+}
+
+// Click an Edit link, wait for Xero to render the edit form, read values, go back
+async function readRuleFromEditPage(linkEl) {
+	const href = linkEl.href ?? linkEl.getAttribute("href") ?? "";
+	const match = href.match(/bank-rules\/edit\/([0-9a-f-]{36})/i);
+	const xero_rule_id = match?.[1] ?? null;
+	console.log(`[XeroOK] clicking edit link for rule ${xero_rule_id}`);
+
+	const urlBefore = location.href;
+	linkEl.click();
+
+	// Wait for URL to change to the edit page
+	await new Promise((resolve) => {
+		const start = Date.now();
+		const check = () => {
+			if (location.href !== urlBefore) { resolve(); return; }
+			if (Date.now() - start > 8000) { resolve(); return; }
+			setTimeout(check, 200);
+		};
+		setTimeout(check, 300);
+	});
+	console.log(`[XeroOK] URL after click: ${location.href}`);
+
+	// Wait for 7+ inputs (the edit form)
+	await new Promise((resolve) => {
+		const start = Date.now();
+		const check = () => {
+			if (visibleInputs().length >= 7 || Date.now() - start > 10000) resolve();
+			else setTimeout(check, 300);
+		};
+		setTimeout(check, 500);
+	});
+
+	const inputs = visibleInputs();
+	console.log(`[XeroOK] edit form inputs (${inputs.length}):`, inputs.map((el, i) => `[${i}] "${el.value?.slice(0, 50)}"`));
+
+	const conditionValue  = inputs[2]?.value?.trim() ?? "";
+	const glRaw           = inputs[5]?.value?.trim() ?? "";
+	const glCode          = glRaw.match(/^\d{4}/)?.[0] ?? glRaw;           // "7050 - Miscellaneous" → "7050"
+	const glName          = glRaw.replace(/^\d{4}\s*-\s*/, "").trim() || glRaw; // → "Miscellaneous"
+	const taxRate         = inputs[6]?.value?.trim() ?? "";
+	const ruleName        = inputs[inputs.length - 1]?.value?.trim() ?? conditionValue;
+
+	// Go back to the list
+	history.back();
+	await new Promise((resolve) => {
+		const start = Date.now();
+		const check = () => {
+			if (location.href === urlBefore) { resolve(); return; }
+			if (Date.now() - start > 6000) { resolve(); return; }
+			setTimeout(check, 200);
+		};
+		setTimeout(check, 300);
+	});
+	await sleep(600); // let list re-render
+
+	return {
+		xero_rule_id,
+		vendor: conditionValue || ruleName,
+		condition_value: conditionValue,
+		gl_code: glCode,
+		gl_name: glName,
+		tax_rate: taxRate,
+		rule_name: ruleName,
+		rule_type: "spend",
+		source: "xero_edit_page",
+	};
 }
 
 async function runBankRulesAutomation() {
-	console.log("[XeroOK] Fetching rules from server and MongoDB");
+	console.log("[XeroOK] Starting auto-create loop");
 
 	let serverRules, xeroRules;
 	try {
 		[serverRules, xeroRules] = await Promise.all([fetchRulesFromServer(), fetchXeroBankRules()]);
 	} catch (err) {
 		console.error("[XeroOK] Failed to fetch rules:", err.message);
-		injectStatusBadge(`❌ Could not reach server — is npm run server:dev running?`, "red");
+		injectStatusBadge(`❌ Could not reach server`, "red");
 		return;
 	}
 
-	// Build set of vendors already in Xero (from MongoDB record, not DOM)
+	// Build set of vendors already in Xero (from MongoDB)
 	const existingVendors = new Set(xeroRules.map(r => (r.vendor ?? "").toLowerCase()));
-	console.log(`[XeroOK] ${serverRules.length} server rules, ${existingVendors.size} already in Xero (MongoDB)`);
-
-	const next = serverRules.find(r => {
+	const missing = serverRules.filter(r => {
 		const payee = (r.payee ?? r.vendor ?? "").toLowerCase();
 		return payee && !existingVendors.has(payee);
 	});
 
-	if (!next) {
+	console.log(`[XeroOK] ${serverRules.length} server rules, ${existingVendors.size} in Xero, ${missing.length} to create`);
+
+	if (missing.length === 0) {
 		injectStatusBadge(`✓ All rules already exist in Xero`, "green");
-		console.log("[XeroOK] No new rules to create");
 		return;
 	}
 
-	const payee = next.payee ?? next.vendor;
-	injectStatusBadge(`⏳ Creating: ${payee}…`, "#13B5EA");
-	console.log(`[XeroOK] Next missing rule: ${payee}`);
+	let created = 0;
+	for (const rule of missing) {
+		const payee = rule.payee ?? rule.vendor;
+		injectStatusBadge(`⏳ Creating ${created + 1}/${missing.length}: ${payee}…`, "#13B5EA");
+		console.log(`[XeroOK] Creating rule ${created + 1}/${missing.length}: ${payee}`);
 
-	try {
-		await createXeroRule(next);
-		// Save to MongoDB so we don't create it again
-		await saveXeroBankRule({
-			vendor: payee,
-			gl_code: next.gl_code ?? next.gl_account_code,
-			gl_name: next.gl_name ?? next.gl_account_name,
-			rule_type: next.rule_type ?? "spend",
-			condition_value: payee,
-		});
-		console.log(`[XeroOK] Saved rule to MongoDB: ${payee}`);
-		injectStatusBadge(`✓ Created: ${payee} — click again for next`, "green");
-	} catch (err) {
-		injectStatusBadge(`❌ Failed: ${err.message}`, "red");
-		console.warn(`[XeroOK] Rule failed (${payee}):`, err.message);
+		try {
+			const xero_rule_id = await createXeroRule(rule);
+			await saveXeroBankRule({
+				vendor: payee,
+				xero_rule_id: xero_rule_id ?? undefined,
+				gl_code: rule.gl_code ?? rule.gl_account_code,
+				gl_name: rule.gl_name ?? rule.gl_account_name,
+				rule_type: rule.rule_type ?? "spend",
+				condition_value: payee,
+			});
+			console.log(`[XeroOK] ✓ Saved to MongoDB: "${payee}" id=${xero_rule_id}`);
+			created++;
+		} catch (err) {
+			console.warn(`[XeroOK] ✗ Failed "${payee}":`, err.message);
+			injectStatusBadge(`❌ Failed on "${payee}": ${err.message}`, "red");
+			return; // stop loop on first error so user can inspect
+		}
 	}
+
+	injectStatusBadge(`✓ Created ${created}/${missing.length} rules`, "green");
+	console.log(`[XeroOK] Auto-create complete — ${created} rules created`);
 }
 
 async function runSyncFromPage() {
 	console.log("[XeroOK] Syncing existing rules from page to MongoDB");
-	const pageTexts = scrapeRulesFromPage();
-	console.log(`[XeroOK] Found ${pageTexts.length} text nodes on page`);
-	// Build minimal rule objects from visible condition values
-	const rules = pageTexts.map(v => ({ vendor: v, condition_value: v, rule_type: "spend", source: "xero_page_scrape" }));
+
+	// Collect hrefs upfront — the link elements will be removed from DOM as we navigate
+	const editHrefs = [...document.querySelectorAll("a[href*='bank-rules/edit']")]
+		.map(a => a.href ?? a.getAttribute("href")).filter(Boolean);
+
+	if (editHrefs.length === 0) {
+		injectStatusBadge("⚠ No Edit links found — are the rules loaded?", "orange");
+		return;
+	}
+
+	const rules = [];
+
+	for (let i = 0; i < editHrefs.length; i++) {
+		injectStatusBadge(`⏳ Reading rule ${i + 1}/${editHrefs.length}…`, "#13B5EA");
+		const href = editHrefs[i];
+		const match = href.match(/bank-rules\/edit\/([0-9a-f-]{36})/i);
+		const xero_rule_id = match?.[1] ?? null;
+
+		// Find the link in the current DOM (we're back on list after each iteration)
+		const linkEl = document.querySelector(`a[href*="${xero_rule_id}"]`);
+		if (!linkEl) {
+			console.warn(`[XeroOK] Edit link not found in DOM for ${xero_rule_id}`);
+			continue;
+		}
+
+		try {
+			const rule = await readRuleFromEditPage(linkEl);
+			console.log(`[XeroOK] read rule ${i + 1}/${editHrefs.length}:`, rule);
+			rules.push(rule);
+		} catch (err) {
+			console.warn(`[XeroOK] failed to read rule ${xero_rule_id}:`, err.message);
+		}
+	}
+
+	if (rules.length === 0) {
+		injectStatusBadge("⚠ Could not read any rules", "orange");
+		return;
+	}
+
 	try {
 		const result = await syncXeroBankRules(rules);
 		injectStatusBadge(`✓ Synced ${result.upserted ?? rules.length} rules to MongoDB`, "green");
-		console.log(`[XeroOK] Synced ${result.upserted} rules`);
+		console.log(`[XeroOK] Sync complete:`, rules);
 	} catch (err) {
 		injectStatusBadge(`❌ Sync failed: ${err.message}`, "red");
+		console.error(`[XeroOK] sync error:`, err);
 	}
 }
 
 function injectStatusBadge(text, color) {
+	// Ensure toolbar exists (may be on create-rule page with only one button)
 	let badge = document.getElementById("xero-ok-badge");
 	if (!badge) {
+		const bar = getOrCreateToolbar();
 		badge = document.createElement("div");
 		badge.id = "xero-ok-badge";
-		badge.style.cssText = "position:fixed;bottom:20px;left:20px;z-index:99999;padding:8px 16px;border-radius:6px;font-weight:600;font-size:13px;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.25);";
-		document.body.appendChild(badge);
+		badge.style.cssText = "padding:5px 12px;border-radius:5px;font-size:12px;font-weight:600;color:#fff;";
+		bar.appendChild(badge);
 	}
+	badge.style.display = "block";
 	badge.style.background = color;
 	badge.textContent = text;
 }
 
-function makeButton(id, label, onClick) {
-	if (document.getElementById(id)) return;
+// ── Toolbar: persistent bottom-left panel with buttons + status chip ──────────
+
+function getOrCreateToolbar() {
+	let bar = document.getElementById("xero-ok-toolbar");
+	if (bar) return bar;
+	bar = document.createElement("div");
+	bar.id = "xero-ok-toolbar";
+	bar.style.cssText = "position:fixed;bottom:20px;left:20px;z-index:99999;display:flex;flex-direction:column;align-items:flex-start;gap:6px;font-family:sans-serif;";
+	document.body.appendChild(bar);
+	return bar;
+}
+
+function makeToolbarButton(id, label, bgColor, onClick) {
+	const existing = document.getElementById(id);
+	if (existing) return existing;
 	const btn = document.createElement("button");
 	btn.id = id;
 	btn.textContent = label;
-	btn.style.cssText = "position:fixed;bottom:20px;left:20px;z-index:99999;padding:8px 18px;background:#13B5EA;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);";
+	btn.style.cssText = `padding:7px 16px;background:${bgColor};color:#fff;border:none;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.2);white-space:nowrap;`;
 	btn.onclick = async () => {
 		btn.disabled = true;
 		btn.textContent = "⏳ Working…";
@@ -535,24 +674,30 @@ function makeButton(id, label, onClick) {
 		btn.disabled = false;
 		btn.textContent = label;
 	};
-	document.body.appendChild(btn);
+	return btn;
 }
 
 function injectBankRulesButton() {
-	makeButton("xero-ok-rules-btn", "⚡ Auto create multiple rules", runBankRulesAutomation);
-	// Second button — positioned slightly above the first
-	const syncBtn = document.createElement("button");
-	syncBtn.id = "xero-ok-sync-btn";
-	syncBtn.textContent = "↻ Sync page → MongoDB";
-	syncBtn.style.cssText = "position:fixed;bottom:64px;left:20px;z-index:99999;padding:6px 14px;background:#6c757d;color:#fff;border:none;border-radius:6px;font-weight:600;font-size:12px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);";
-	syncBtn.onclick = async () => {
-		syncBtn.disabled = true;
-		syncBtn.textContent = "⏳ Syncing…";
-		await runSyncFromPage();
-		syncBtn.disabled = false;
-		syncBtn.textContent = "↻ Sync page → MongoDB";
-	};
-	document.body.appendChild(syncBtn);
+	const bar = getOrCreateToolbar();
+
+	// Row of two buttons side by side
+	const row = document.createElement("div");
+	row.id = "xero-ok-btn-row";
+	row.style.cssText = "display:flex;gap:8px;";
+
+	const syncBtn = makeToolbarButton("xero-ok-sync-btn", "↻ Sync → MongoDB", "#6c757d", runSyncFromPage);
+	const autoBtn = makeToolbarButton("xero-ok-rules-btn", "⚡ Auto create rules", "#13B5EA", runBankRulesAutomation);
+
+	row.appendChild(syncBtn);
+	row.appendChild(autoBtn);
+	bar.appendChild(row);
+
+	// Status chip starts empty — updated by injectStatusBadge
+	const chip = document.createElement("div");
+	chip.id = "xero-ok-badge";
+	chip.style.cssText = "display:none;padding:5px 12px;border-radius:5px;font-size:12px;font-weight:600;color:#fff;";
+	bar.appendChild(chip);
+
 	console.log("[XeroOK] Bank Rules buttons injected");
 }
 
@@ -585,7 +730,13 @@ async function runFillFormAutomation() {
 }
 
 function injectFillFormButton() {
-	makeButton("xero-ok-fill-btn", "⚡ Fill from MongoDB", runFillFormAutomation);
+	const bar = getOrCreateToolbar();
+	const btn = makeToolbarButton("xero-ok-fill-btn", "⚡ Fill from MongoDB", "#13B5EA", runFillFormAutomation);
+	bar.appendChild(btn);
+	const chip = document.createElement("div");
+	chip.id = "xero-ok-badge";
+	chip.style.cssText = "display:none;padding:5px 12px;border-radius:5px;font-size:12px;font-weight:600;color:#fff;";
+	bar.appendChild(chip);
 	console.log("[XeroOK] Create rule fill button injected");
 }
 
@@ -603,11 +754,7 @@ function injectFillFormButton() {
 })();
 
 function onRouteChange() {
-	// Clean up buttons from previous page
-	document.getElementById("xero-ok-rules-btn")?.remove();
-	document.getElementById("xero-ok-fill-btn")?.remove();
-	document.getElementById("xero-ok-sync-btn")?.remove();
-	document.getElementById("xero-ok-badge")?.remove();
+	document.getElementById("xero-ok-toolbar")?.remove();
 
 	if (isCreateRulePage()) {
 		setTimeout(injectFillFormButton, 800);
